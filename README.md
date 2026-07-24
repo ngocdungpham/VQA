@@ -224,7 +224,7 @@ POST <BASE_URL>/chat/completions
 Ví dụ với 9Router chạy local:
 
 ```bash
-export NINEROUTER_BASE_URL="http://127.0.0.1:20128/v1"
+export NINEROUTER_BASE_URL=""
 export NINEROUTER_API_KEY="YOUR_API_KEY"
 ```
 
@@ -952,10 +952,3 @@ Sau test:
 - [ ] Đã lưu log, metadata và checksum.
 - [ ] Đã phân tích lỗi theo dạng câu hỏi và nhờ chuyên gia kiểm tra mẫu.
 
-## 16. Báo cáo
-
-Báo cáo đánh giá hiện tại nằm tại:
-
-```text
-reports/BAO_CAO_DANH_GIA_VQA_NOI_SOI_PHE_QUAN.md
-```
