@@ -35,6 +35,25 @@ DEFAULT_IM_START_TOKEN = "<im_start>"
 DEFAULT_IM_END_TOKEN = "<im_end>"
 
 
+class CanonicalCLIPPositionEmbedding(nn.Module):
+    """Return canonical CLIP positions without a CUDA embedding gather."""
+
+    def __init__(self, embedding):
+        super().__init__()
+        self.weight = embedding.weight
+        self.num_embeddings = embedding.num_embeddings
+        self.embedding_dim = embedding.embedding_dim
+
+    def forward(self, position_ids):
+        seq_len = position_ids.shape[-1]
+        if seq_len > self.num_embeddings:
+            raise ValueError(
+                f"CLIP sequence has {seq_len} positions, but only "
+                f"{self.num_embeddings} embeddings are available."
+            )
+        return self.weight[:seq_len].unsqueeze(0)
+
+
 class LlavaConfig(LlamaConfig):
     model_type = "llava_custom"
 
@@ -46,7 +65,12 @@ class LlavaLlamaModel(LlamaModel):
         super(LlavaLlamaModel, self).__init__(config)
 
         self.vision_tower_name = "openai/clip-vit-large-patch14" # microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224 # openai/clip-vit-large-patch14
-        if hasattr(config, "mm_vision_tower"):
+        # During 4-bit training, Transformers/Accelerate constructs the outer
+        # model in an empty-weights context. Loading CLIP here would therefore
+        # create a meta-only tower whose checkpoint copies are no-ops. Defer
+        # CLIP until initialize_vision_modules() runs after LLM loading.
+        defer_vision_tower = os.environ.get("LLAVA_DEFER_VISION_TOWER", "0") == "1"
+        if hasattr(config, "mm_vision_tower") and not defer_vision_tower:
             # HACK: for FSDP
             if "BiomedCLIP" in config.mm_vision_tower or "biomed_clip" in config.mm_vision_tower:
                 model, _, _ = open_clip.create_model_and_transforms('hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224')
@@ -82,6 +106,30 @@ class LlavaLlamaModel(LlamaModel):
             vision_tower = CLIPVisionModel.from_pretrained(vision_tower)
         else:
             vision_tower = self.vision_tower[0]
+            # Quantized loading with recent Transformers/Accelerate can build
+            # this nested CLIP module under an empty-weights context. Reload
+            # the actual pretrained weights before moving the tower to CUDA.
+            if vision_tower.device.type == 'meta':
+                vision_tower = CLIPVisionModel.from_pretrained(
+                    vision_tower.config._name_or_path,
+                    torch_dtype=torch.float16,
+                    low_cpu_mem_usage=False,
+                )
+        # position_ids is a non-persistent CLIP buffer, so it is absent from
+        # the checkpoint. With meta/quantized loading it can be materialized
+        # without valid values. Rebuild the canonical [0, ..., N-1] indices.
+        vision_embeddings = vision_tower.vision_model.embeddings
+        num_positions = vision_embeddings.position_embedding.num_embeddings
+        vision_embeddings.position_ids = torch.arange(
+            num_positions, dtype=torch.long
+        ).expand((1, -1))
+        # CLIP always consumes the canonical consecutive positions. Returning
+        # the corresponding weight rows directly is mathematically identical
+        # to embedding(arange(N)) and avoids a CUDA gather incompatibility
+        # observed with current Colab PyTorch on T4.
+        vision_embeddings.position_embedding = CanonicalCLIPPositionEmbedding(
+            vision_embeddings.position_embedding
+        )
         vision_tower.requires_grad_(False)
         vision_tower = vision_tower.to(torch.float16)
         self.vision_tower = [vision_tower]
@@ -368,12 +416,16 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM):
                                     tune_mm_mlp_adapter=False, pretrain_mm_mlp_adapter=None):
         vision_config = self.model.vision_tower[0].config
         vision_config.use_im_start_end = mm_use_im_start_end
-        tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)
-        self.resize_token_embeddings(len(tokenizer))
+        num_patch_tokens = tokenizer.add_tokens(
+            [DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True
+        )
+        if num_patch_tokens > 0:
+            self.resize_token_embeddings(len(tokenizer))
 
         if mm_use_im_start_end:
             num_new_tokens = tokenizer.add_tokens([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True)
-            self.resize_token_embeddings(len(tokenizer))
+            if num_new_tokens > 0:
+                self.resize_token_embeddings(len(tokenizer))
             vision_config.im_start_token, vision_config.im_end_token = tokenizer.convert_tokens_to_ids([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN])
 
             if num_new_tokens > 0:

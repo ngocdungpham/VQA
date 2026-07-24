@@ -10,4 +10,4 @@ torch
 torchvision
 uvicorn
 wandb
-transformers@ git+https://github.com/huggingface/transformers.git@cae78c46
+transformers @ git+https://github.com/huggingface/transformers.git@cae78c46

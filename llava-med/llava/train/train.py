@@ -25,6 +25,7 @@ from typing import Dict, Optional, Sequence
 import torch
 
 import transformers
+from transformers.utils.quantization_config import QuantizationMethod
 from torch.utils.data import Dataset
 from llava.train.llava_trainer import LLaVATrainer
 
@@ -85,6 +86,31 @@ class TrainingArguments(transformers.TrainingArguments):
             "Maximum sequence length. Sequences will be right padded (and possibly truncated)."
         },
     )
+    lora_enable: bool = field(default=False)
+    lora_r: int = field(default=16)
+    lora_alpha: int = field(default=32)
+    lora_dropout: float = field(default=0.05)
+    lora_target_modules: str = field(
+        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+    )
+    bits: int = field(default=16)
+
+
+def maybe_zero_3(param):
+    if hasattr(param, "ds_id"):
+        import deepspeed
+        with deepspeed.zero.GatheredParameters([param]):
+            param = param.data.detach().cpu().clone()
+    else:
+        param = param.detach().cpu().clone()
+    return param
+
+
+def get_peft_state_maybe_zero_3(named_params):
+    to_return = {
+        k: t for k, t in named_params if "lora_" in k or "modules_to_save" in k
+    }
+    return {k: maybe_zero_3(v) for k, v in to_return.items()}
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
@@ -490,16 +516,52 @@ def train():
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    compute_dtype = (
+        torch.float16 if training_args.fp16 else
+        torch.bfloat16 if training_args.bf16 else
+        torch.float32
+    )
+    load_kwargs = dict(cache_dir=training_args.cache_dir)
+    if training_args.bits in [4, 8]:
+        import transformers.modeling_utils as modeling_utils
+
+        original_dispatch_model = modeling_utils.dispatch_model
+
+        def dispatch_model_with_quant_hooks(model, *args, **kwargs):
+            kwargs["force_hooks"] = True
+            return original_dispatch_model(model, *args, **kwargs)
+
+        modeling_utils.dispatch_model = dispatch_model_with_quant_hooks
+        load_kwargs.update(
+            dict(
+                device_map={"": int(os.environ.get("LOCAL_RANK", 0))},
+                quantization_config=transformers.BitsAndBytesConfig(
+                    load_in_4bit=training_args.bits == 4,
+                    load_in_8bit=training_args.bits == 8,
+                    llm_int8_skip_modules=["mm_projector"],
+                    llm_int8_threshold=6.0,
+                    bnb_4bit_compute_dtype=compute_dtype,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                ),
+            )
+        )
+
     if model_args.vision_tower is not None:
         model = LlavaLlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
+            **load_kwargs,
         )
     else:
         model = transformers.LlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
+            **load_kwargs,
         )
+    if training_args.bits in [4, 8]:
+        model.is_loaded_in_4bit = training_args.bits == 4
+        model.is_loaded_in_8bit = training_args.bits == 8
+        model.is_quantized = True
+        model.quantization_method = QuantizationMethod.BITS_AND_BYTES
     model.config.use_cache = False
 
     if model_args.freeze_backbone:
@@ -564,6 +626,30 @@ def train():
         model.initialize_vision_tokenizer(mm_use_im_start_end=model_args.mm_use_im_start_end, tokenizer=tokenizer, device=training_args.device,
                                           tune_mm_mlp_adapter=model_args.tune_mm_mlp_adapter, pretrain_mm_mlp_adapter=model_args.pretrain_mm_mlp_adapter)
 
+    if training_args.lora_enable:
+        from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+        if training_args.bits in [4, 8]:
+            model = prepare_model_for_kbit_training(
+                model,
+                use_gradient_checkpointing=training_args.gradient_checkpointing,
+            )
+
+        lora_config = LoraConfig(
+            r=training_args.lora_r,
+            lora_alpha=training_args.lora_alpha,
+            target_modules=[
+                item.strip()
+                for item in training_args.lora_target_modules.split(",")
+                if item.strip()
+            ],
+            lora_dropout=training_args.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+
         params_no_grad = [n for n, p in model.named_parameters() if not p.requires_grad]
         if len(params_no_grad) > 0:
             if training_args.fsdp is not None and len(training_args.fsdp) > 0:
@@ -596,8 +682,13 @@ def train():
     else:
         trainer.train()
     trainer.save_state()
-    safe_save_model_for_hf_trainer(trainer=trainer,
-                                   output_dir=training_args.output_dir)
+    if training_args.lora_enable:
+        state_dict = get_peft_state_maybe_zero_3(model.named_parameters())
+        model.save_pretrained(training_args.output_dir, state_dict=state_dict)
+        tokenizer.save_pretrained(training_args.output_dir)
+    else:
+        safe_save_model_for_hf_trainer(trainer=trainer,
+                                       output_dir=training_args.output_dir)
 
 
 if __name__ == "__main__":
